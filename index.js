@@ -33,7 +33,8 @@ class EG4Bridge extends EventEmitter {
     this.holdIntervalMs   = options.holdIntervalMs ?? 60000;
 
     this.inverter_num = +(options.inverter_num || 1)
-
+    this.HEADER_LENGTH = 18
+    //if(options.official_dongle) this.HEADER_LENGTH = 20
     // ---- State machine ----
     this.State = {
       DISCONNECTED: 0,
@@ -202,7 +203,38 @@ class EG4Bridge extends EventEmitter {
       return false;
     }
   }
+  /*
+  sendBytes(buf) {
+    if (!this.socket || !this.connected) return false;
 
+    try {
+      const preview = buf
+        .subarray(0, Math.min(buf.length, 32))
+        .toString('hex')
+        .match(/.{1,2}/g)
+        ?.join(' ')
+        .toUpperCase();
+
+      this.emit('log', {
+        inverter_num: this.inverter_num,
+        level: 'debug',
+        msg: `TCP TX length=${buf.length}: ${preview}`
+      });
+
+      this.socket.write(buf);
+      return true;
+    } catch (error) {
+      this.emit('log', {
+        inverter_num: this.inverter_num,
+        level: 'warn',
+        msg: `Send failed: ${error.message}`
+      });
+
+      this.closeSocket();
+      return false;
+    }
+  }
+  */
   // --------------------------
   // Packet framing + parsing
   // --------------------------
@@ -657,7 +689,8 @@ class EG4Bridge extends EventEmitter {
 
   buildHeader(dataLength) {
     const fl = dataLength + 14; // frame_length
-    const pkt = Buffer.alloc(20 + dataLength + 2); // header + data + crc
+    //const pkt = Buffer.alloc(20 + dataLength + 2); // header + data + crc
+    const pkt = Buffer.alloc(this.HEADER_LENGTH + dataLength + 2); // header + data + crc
     pkt[0] = 0xA1; pkt[1] = 0x1A;
     pkt[2] = 0x02; pkt[3] = 0x00;
     pkt.writeUInt16LE(fl, 4);
