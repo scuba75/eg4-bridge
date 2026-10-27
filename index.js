@@ -6,6 +6,7 @@ import EventEmitter from 'events';
 import INVERTER_STATES from './inverter_states.json' with { type: 'json' };
 import WARNING_CODES from './warning_codes.json' with { type: 'json' };
 import FAULT_CODES from './fault_codes.json' with { type: 'json' };
+import { register } from 'module';
 
 const POWER_COST = parseFloat(process.env.POWER_COST || "0.1044288425047438")
 const roundValue = (value, decimal_places)=>{
@@ -34,6 +35,7 @@ class EG4Bridge extends EventEmitter {
 
     this.inverter_num = +(options.inverter_num || 1)
     this.HEADER_LENGTH = 18
+    this.isMaster = false
     //if(options.official_dongle) this.HEADER_LENGTH = 20
     // ---- State machine ----
     this.State = {
@@ -418,21 +420,73 @@ class EG4Bridge extends EventEmitter {
 
   processHoldDerived() {
     const now = Date.now();
-
+    function isAcCouplingEnabled(value) {
+      return (value & (1 << 11)) !== 0;
+    }
+    function decodeRawTime(raw){
+      const hour = raw & 0xFF;
+      const minute = (raw >> 8) & 0xFF;
+      if (hour > 23 || minute > 59) return null;
+      return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
+    };
+    function decodeFunction4En(value) {
+      return {
+        quickChgStart: !!(value & (1 << 0)),
+        battBackup: !!(value & (1 << 1)),
+        maintenance: !!(value & (1 << 2)),
+        workingMode: !!(value & (1 << 3)),
+        dryContactorMultiplex: (value >> 4) & 0x0F,
+        exCTPosition: (value >> 8) & 0x03,
+        overFreqFStop: !!(value & (1 << 10))
+      };
+    }
+    /*
+    if(this.isMaster){
+      console.log(`inv_num: ${this.inverter_num}`)
+      console.log(this.holdRegs[233])
+      console.log(decodeFunction4En(this.holdRegs[233]))
+      console.log(this.holdRegs[234])
+    }
+      */
+    const schedule_data = {}
+    if(this.holdRegs[68] >= 0) schedule_data.grid_charge_start = decodeRawTime(this.holdRegs[68])
+    if(this.holdRegs[69] >= 0) schedule_data.grid_charge_end = decodeRawTime(this.holdRegs[69])
+    if(this.holdRegs[152] >= 0) schedule_data.grid_first_start = decodeRawTime(this.holdRegs[152])
+    if(this.holdRegs[153] >= 0) schedule_data.grid_first_end = decodeRawTime(this.holdRegs[153])
     const derived = {
       schedule: {
         grid_charge_start: { raw: this.holdRegs[68], register: 68 },
         grid_charge_end: { raw: this.holdRegs[69], register: 69 },
         grid_first_start: { raw: this.holdRegs[152], register: 152 },
-        grid_first_end: { raw: this.holdRegs[153], register: 153}
+        grid_first_end: { raw: this.holdRegs[153], register: 153},        
+        isMaster: this.isMaster
+      },
+      func_en2: {
+        raw: this.holdRegs[179],
+        register: 179,        
+        inverter_num: this.inverter_num,
+        isMaster: this.isMaster
+      },
+      ac_charge: {
+        battery_charge_soc_start: this.holdRegs[160],
+        battery_charge_soc_end: this.holdRegs[161],
+        ac_quick_charge_duration: this.holdRegs[234],
+        uFunction4En: this.holdRegs[233],
+        isMaster: this.isMaster
       }
     };
     const ac_charge = {
       battery_charge_soc_start: this.holdRegs[160],
-      battery_charge_soc_end: this.holdRegs[161]
+      battery_charge_soc_end: this.holdRegs[161],
+      ac_quick_charge_duration: this.holdRegs[234],
+      uFunction4En: this.holdRegs[233],
+      isMaster: this.isMaster
     }
-    this.emit('hold_data', { inverter_num: this.inverter_num, data: derived });
-    this.emit('data', { inverter_num: this.inverter_num, data: ac_charge });
+    
+    this.emit('hold_data', { inverter_num: this.inverter_num, data: derived, isMaster: this.isMaster });
+    this.emit('data', { inverter_num: this.inverter_num, data: schedule_data, isMaster: this.isMaster });
+    this.emit('data', { inverter_num: this.inverter_num, data: { ac_quick_charge_duration: this.holdRegs[234] }, isMaster: this.isMaster });
+    this.emit('data', { inverter_num: this.inverter_num, data: { ac_couple_state: isAcCouplingEnabled(this.holdRegs[179]) ? 'ON':'OFF',  }, isMaster: this.isMaster });
   }
   // --------------------------
   // Bank decoders (little-endian)
@@ -541,10 +595,11 @@ class EG4Bridge extends EventEmitter {
       grid_available: (grid_voltage > 100) ? "ON":"OFF",
       battery_energy_cost_daily: roundValue(ac_charge_energy_daily * POWER_COST),
       grid_energy_cost_daily: roundValue(grid_energy_daily * POWER_COST),
-      get_open_dtu_values:  true
+      get_open_dtu_values:  true,
+      isMaster: this.isMaster
     };
 
-    this.emit('data', { inverter_num: this.inverter_num, data: payload });
+    this.emit('data', { inverter_num: this.inverter_num, data: payload, isMaster: this.isMaster });
   }
 
   processBank1(buf) {
@@ -580,10 +635,12 @@ class EG4Bridge extends EventEmitter {
 
     this.emit('data', {
         inverter_num: this.inverter_num,
+        isMaster: this.isMaster,
         data: {
           active_fault, active_warning, temperature: roundValue(temperature, 1),
           active_fault_text: FAULT_CODES[active_fault] || 'Unknown',
-          active_warning_text: WARNING_CODES[active_warning] || 'Unknown'
+          active_warning_text: WARNING_CODES[active_warning] || 'Unknown',
+          isMaster: this.isMaster
         }
     });
   }
@@ -619,6 +676,7 @@ class EG4Bridge extends EventEmitter {
     const orderBits    = (reg113 >> 4)  & 0x03;
     const parallelNum  = (reg113 >> 8)  & 0xFF;
 
+    if(master_slave == 1) this.isMaster = true
     const role =
       master_slave === 1 ? 'Master' :
       master_slave === 2 ? 'Slave'  :
@@ -636,9 +694,11 @@ class EG4Bridge extends EventEmitter {
 
     this.emit('data', {
       inverter_num: this.inverter_num,
+      isMaster: this.isMaster,
       data: {
         battery_cycle_count: +(battery_cycle_count || 0), master_slave,
-        role, battery_capacity: +battery_capacity
+        role, battery_capacity: +battery_capacity,
+        isMaster: this.isMaster
       }
     });
   }
@@ -665,7 +725,7 @@ class EG4Bridge extends EventEmitter {
 
     this.emit('data', {
       inverter_num: this.inverter_num,
-      data: { ac_couple_pwr }
+      data: { ac_couple_pwr, isMaster: this.isMaster }
     });
   }
 
@@ -677,8 +737,10 @@ class EG4Bridge extends EventEmitter {
 
     this.emit('data', {
       inverter_num: this.inverter_num,
+      isMaster: this.isMaster,
       data: {
-        load_power
+        load_power,
+        isMaster: this.isMaster
       }
     });
   }
